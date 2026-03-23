@@ -228,6 +228,67 @@
       overflow: hidden;
     }
 
+    /* ── Right prompt navigation ─────────────────────────── */
+    #right-nav {
+      width: 220px;
+      min-width: 220px;
+      background: var(--sidebar-bg);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 20px 14px;
+      gap: 18px;
+      overflow-y: auto;
+    }
+
+    #right-nav h1 {
+      font-size: 1.0rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 0.4px;
+    }
+
+    #prompt-nodes {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .prompt-node {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 0.9rem;
+      padding: 10px 10px;
+      transition: border-color 0.2s, color 0.2s, background 0.2s;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      user-select: none;
+    }
+
+    .prompt-node:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .prompt-node.active {
+      border-color: var(--accent);
+      color: #fff;
+      background: rgba(233, 69, 96, 0.12);
+    }
+
+    #prompt-nodes-empty {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      line-height: 1.4;
+      padding: 8px 0;
+    }
+
     #messages {
       flex: 1;
       overflow-y: auto;
@@ -495,9 +556,19 @@
   </div>
 </main>
 
+<!-- ── Right navigation ───────────────────────────────────── -->
+<aside id="right-nav">
+  <h1>Prompts</h1>
+  <div class="divider">Jump to</div>
+  <div id="prompt-nodes">
+    <div id="prompt-nodes-empty">Your sent prompts will appear here.</div>
+  </div>
+</aside>
+
 <script>
   // ── State ─────────────────────────────────────────────────
   let streaming = false;
+  let userPromptCounter = 0;
 
   // ── DOM refs ──────────────────────────────────────────────
   const modelSelect   = document.getElementById("model-select");
@@ -511,6 +582,8 @@
   const streamingToggle = document.getElementById("streaming-toggle");
   const btnClear      = document.getElementById("btn-clear");
   const messagesEl    = document.getElementById("messages");
+  const promptNodesEl = document.getElementById("prompt-nodes");
+  const promptNodesEmptyEl = document.getElementById("prompt-nodes-empty");
   const userInput     = document.getElementById("user-input");
   const btnSend       = document.getElementById("btn-send");
   const emptyState    = document.getElementById("empty-state");
@@ -560,6 +633,11 @@
     messagesEl.innerHTML = "";
     messagesEl.appendChild(emptyState);
     emptyState.style.display = "flex";
+
+    // Reset local prompt-jump UI state.
+    document.querySelectorAll(".prompt-node").forEach(el => el.remove());
+    if (promptNodesEmptyEl) promptNodesEmptyEl.style.display = "block";
+    userPromptCounter = 0;
   });
 
   // ── Helpers ───────────────────────────────────────────────
@@ -589,7 +667,7 @@
     wrapper.appendChild(bubble);
     messagesEl.appendChild(wrapper);
     scrollToBottom();
-    return bubble;
+    return wrapper;
   }
 
   function appendError(msg) {
@@ -626,6 +704,25 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
+  function scrollToUserMessage(el, nodeBtn = null) {
+    const elRect = el.getBoundingClientRect();
+    const containerRect = messagesEl.getBoundingClientRect();
+
+    // Convert element position into the scrollable container's coordinate space.
+    const targetTop = elRect.top - containerRect.top + messagesEl.scrollTop;
+
+    messagesEl.scrollTo({
+      top: Math.max(0, targetTop - 8),
+      behavior: "smooth",
+    });
+
+    if (nodeBtn) {
+      const prevActive = document.querySelector(".prompt-node.active");
+      if (prevActive) prevActive.classList.remove("active");
+      nodeBtn.classList.add("active");
+    }
+  }
+
   function setStreaming(val) {
     streaming = val;
     btnSend.disabled = val;
@@ -644,7 +741,11 @@
       return;
     }
 
-    appendMessage("user", message, false);
+    userPromptCounter += 1;
+    const userMsgId = `user-msg-${userPromptCounter}`;
+    const userWrapperEl = appendMessage("user", message, false);
+    userWrapperEl.id = userMsgId;
+    addPromptNode(userPromptCounter, userMsgId, message);
     userInput.value = "";
     userInput.style.height = "auto";
 
@@ -738,6 +839,34 @@
     } finally {
       setStreaming(false);
     }
+  }
+
+  function addPromptNode(num, targetId, promptText) {
+    if (!promptNodesEl) return;
+    if (promptNodesEmptyEl) promptNodesEmptyEl.style.display = "none";
+
+    const nodeBtn = document.createElement("button");
+    nodeBtn.type = "button";
+    nodeBtn.className = "prompt-node";
+    const label = makePromptLabel(promptText);
+    nodeBtn.textContent = label;
+    if (promptText) nodeBtn.title = promptText;
+    nodeBtn.dataset.targetId = targetId;
+    nodeBtn.addEventListener("click", () => {
+      const el = document.getElementById(targetId);
+      if (!el) return;
+      scrollToUserMessage(el, nodeBtn);
+    });
+    promptNodesEl.appendChild(nodeBtn);
+  }
+
+  function makePromptLabel(text) {
+    const oneLine = String(text || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const maxLen = 32;
+    if (oneLine.length <= maxLen) return oneLine || "(empty)";
+    return oneLine.slice(0, maxLen - 3) + "...";
   }
 </script>
 </body>
