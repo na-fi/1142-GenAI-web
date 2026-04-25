@@ -1,3 +1,4 @@
+import asyncio
 import io
 import json
 import re
@@ -9,12 +10,15 @@ from dotenv import load_dotenv
 from flask import Flask, Response, render_template, request, session, stream_with_context, send_file
 from flask_sqlalchemy import SQLAlchemy
 from openai import OpenAI, APIError
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from tavily import TavilyClient
 import yfinance as yf
 
 load_dotenv()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GITHUB_TOKEN = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
 
 app = Flask(__name__)
 app.secret_key = "groq-chat-secret-key-change-in-prod"
@@ -122,6 +126,39 @@ def execute_python(code):
     except Exception as e:
         return f"Error executing code: {str(e)}"
 
+async def _run_github_mcp(action, tool_name=None, tool_args=None):
+    params = StdioServerParameters(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-github"],
+        env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": GITHUB_TOKEN},
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            if action == "list":
+                return (await session.list_tools()).tools
+            result = await session.call_tool(tool_name, tool_args or {})
+            return result.content[0].text if result.content else ""
+
+def _load_github_tools():
+    raw = asyncio.run(_run_github_mcp("list"))
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description or t.name,
+                "parameters": t.inputSchema,
+            },
+        }
+        for t in raw
+    ]
+    names = {t.name for t in raw}
+    return tools, names
+
+def call_github_tool(name, args):
+    return asyncio.run(_run_github_mcp("call", tool_name=name, tool_args=args))
+
 TOOLS = [
     {
         "type": "function",
@@ -179,6 +216,16 @@ TOOLS = [
         }
     }
 ]
+
+GITHUB_TOOLS = []
+GITHUB_TOOL_NAMES = set()
+
+if GITHUB_TOKEN:
+    try:
+        GITHUB_TOOLS, GITHUB_TOOL_NAMES = _load_github_tools()
+        print(f"[GitHub MCP] Loaded {len(GITHUB_TOOLS)} tools: {sorted(GITHUB_TOOL_NAMES)}")
+    except Exception as e:
+        print(f"[GitHub MCP] Init failed: {e}")
 
 # llama-3.3-70b-versatile on Groq intermittently emits its native Llama
 # tool-call syntax as text instead of OpenAI tool_calls, e.g.
