@@ -370,6 +370,17 @@
     }
     .msg-bubble a { color: var(--accent); }
 
+    .routed-model-tag {
+      font-size: 0.72rem;
+      color: var(--text-muted, #888);
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      padding: 2px 8px;
+      margin-bottom: 4px;
+      align-self: flex-start;
+    }
+
     .msg-error {
       background: var(--error-bg);
       border: 1px solid var(--error-border);
@@ -498,6 +509,16 @@
 
   <div class="param-row">
     <div class="toggle-row">
+      <label title="Automatically select the best model for the task">Auto-Routing</label>
+      <label class="toggle-switch">
+        <input type="checkbox" id="auto-route-toggle" />
+        <span class="toggle-slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <div class="param-row">
+    <div class="toggle-row">
       <label>Streaming</label>
       <label class="toggle-switch">
         <input type="checkbox" id="streaming-toggle" checked />
@@ -531,11 +552,7 @@
     <input type="number" id="max-tokens" value="1024" min="64" max="32768" step="64" />
   </div>
 
-  <div class="sidebar-group">
-    <label>Groq API Key</label>
-    <input type="password" id="api-key" placeholder="gsk_…" autocomplete="off" />
-  </div>
-
+  <button id="btn-export" style="margin-top: 10px; background: transparent; border: 1px solid var(--border); border-radius: 8px; color: var(--text-muted); cursor: pointer; font-size: 0.85rem; padding: 8px 12px; text-align: center; transition: border-color 0.2s, color 0.2s; width: 100%;">Export History (.md)</button>
   <button id="btn-clear">Clear History</button>
 </aside>
 
@@ -544,13 +561,19 @@
   <div id="messages">
     <div id="empty-state">
       <div class="logo">G</div>
-      <p>Enter your API key and start chatting.</p>
+      <p>Start chatting.</p>
     </div>
   </div>
 
   <div id="input-area">
-    <div id="input-row">
-      <textarea id="user-input" placeholder="Message Groq…" rows="1"></textarea>
+    <div id="image-preview-container" style="display: none; padding: 10px; border: 1px solid var(--border); border-bottom: none; background: var(--input-bg); border-top-left-radius: 14px; border-top-right-radius: 14px; position: relative;">
+      <img id="image-preview" style="max-height: 100px; border-radius: 8px;">
+      <button id="btn-remove-image" style="position: absolute; top: 5px; left: 105px; background: var(--accent); color: white; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center;">&times;</button>
+    </div>
+    <div id="input-row" style="position: relative;">
+      <input type="file" id="file-input" accept="image/*" style="display: none;">
+      <button id="btn-attach" title="Attach Image" style="background: transparent; border: none; cursor: pointer; color: var(--text-muted); padding: 0 5px; font-size: 1.2rem;">📎</button>
+<textarea id="user-input" placeholder="Message Groq…" rows="1"></textarea>
       <button id="btn-send">Send</button>
     </div>
   </div>
@@ -569,6 +592,14 @@
   // ── State ─────────────────────────────────────────────────
   let streaming = false;
   let userPromptCounter = 0;
+  let attachedImageBase64 = null;
+  let csrfToken = "";
+
+  // ── Fetch CSRF token at page load ─────────────────────────
+  fetch("/csrf_token")
+    .then(r => r.json())
+    .then(data => { csrfToken = data.token || ""; })
+    .catch(() => {});
 
   // ── DOM refs ──────────────────────────────────────────────
   const modelSelect   = document.getElementById("model-select");
@@ -578,16 +609,22 @@
   const toppSlider    = document.getElementById("top-p");
   const toppVal       = document.getElementById("topp-val");
   const maxTokens     = document.getElementById("max-tokens");
-  const apiKeyInput   = document.getElementById("api-key");
   const streamingToggle = document.getElementById("streaming-toggle");
+  const autoRouteToggle = document.getElementById("auto-route-toggle");
   const btnClear      = document.getElementById("btn-clear");
+  const btnExport     = document.getElementById("btn-export");
   const messagesEl    = document.getElementById("messages");
   const promptNodesEl = document.getElementById("prompt-nodes");
   const promptNodesEmptyEl = document.getElementById("prompt-nodes-empty");
   const userInput     = document.getElementById("user-input");
   const btnSend       = document.getElementById("btn-send");
   const emptyState    = document.getElementById("empty-state");
-
+  
+  const btnAttach     = document.getElementById("btn-attach");
+  const fileInput     = document.getElementById("file-input");
+  const imagePreviewContainer = document.getElementById("image-preview-container");
+  const imagePreview  = document.getElementById("image-preview");
+  const btnRemoveImage = document.getElementById("btn-remove-image");
   // ── Load models ───────────────────────────────────────────
   fetch("/models")
     .then(r => r.json())
@@ -600,6 +637,31 @@
         modelSelect.appendChild(opt);
       });
     });
+
+  // ── Image Handling ──────────────────────────────────────────
+  btnAttach.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (re) => {
+        attachedImageBase64 = re.target.result;
+        imagePreview.src = attachedImageBase64;
+        imagePreviewContainer.style.display = "block";
+      };
+      reader.readAsDataURL(file);
+    }
+  });
+  btnRemoveImage.addEventListener("click", () => {
+    attachedImageBase64 = null;
+    imagePreviewContainer.style.display = "none";
+    fileInput.value = "";
+  });
+
+  // ── Chat Export ───────────────────────────────────────────
+  btnExport.addEventListener("click", () => {
+    window.location.href = "/export";
+  });
 
   // ── Slider live update ─────────────────────────────────────
   tempSlider.addEventListener("input", () => {
@@ -629,7 +691,11 @@
 
   // ── Clear history ─────────────────────────────────────────
   btnClear.addEventListener("click", async () => {
-    await fetch("/clear", { method: "POST" });
+    await fetch("/clear", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ csrf_token: csrfToken }),
+    });
     messagesEl.innerHTML = "";
     messagesEl.appendChild(emptyState);
     emptyState.style.display = "flex";
@@ -643,6 +709,14 @@
   // ── Helpers ───────────────────────────────────────────────
   function hideEmptyState() {
     emptyState.style.display = "none";
+  }
+
+  function showRoutedModelTag(wrapper, modelName) {
+    if (wrapper.querySelector(".routed-model-tag")) return;
+    const tag = document.createElement("div");
+    tag.className = "routed-model-tag";
+    tag.textContent = "Auto-routed to: " + modelName;
+    wrapper.insertBefore(tag, wrapper.querySelector(".msg-bubble"));
   }
 
   function appendMessage(role, content, isMarkdown = false) {
@@ -732,34 +806,44 @@
 
   // ── Main send function ─────────────────────────────────────
   async function sendMessage() {
-    const message = userInput.value.trim();
-    if (!message) return;
+    const textMessage = userInput.value.trim();
+    if (!textMessage && !attachedImageBase64) return;
 
-    const apiKey = apiKeyInput.value.trim();
-    if (!apiKey) {
-      appendError("Please enter your Groq API key in the sidebar.");
-      return;
+    let payloadMessage = textMessage;
+    let displayMessage = textMessage;
+
+    if (attachedImageBase64) {
+      payloadMessage = [
+        { type: "text", text: textMessage || "What is in this image?" },
+        { type: "image_url", image_url: { url: attachedImageBase64 } }
+      ];
+      displayMessage = (textMessage ? textMessage + "\n" : "") + "*(Image Attached)*";
     }
 
     userPromptCounter += 1;
     const userMsgId = `user-msg-${userPromptCounter}`;
-    const userWrapperEl = appendMessage("user", message, false);
+    const userWrapperEl = appendMessage("user", displayMessage, true);
     userWrapperEl.id = userMsgId;
-    addPromptNode(userPromptCounter, userMsgId, message);
+    addPromptNode(userPromptCounter, userMsgId, displayMessage);
+    
     userInput.value = "";
     userInput.style.height = "auto";
+    const currentAttachedImage = attachedImageBase64;
+    attachedImageBase64 = null;
+    imagePreviewContainer.style.display = "none";
+    fileInput.value = "";
 
     const useStream = streamingToggle.checked;
 
     const payload = {
-      message,
+      message: payloadMessage,
       system_prompt: systemPrompt.value,
       model: modelSelect.value,
       temperature: parseFloat(tempSlider.value),
       top_p: parseFloat(toppSlider.value),
       max_tokens: parseInt(maxTokens.value, 10),
-      api_key: apiKey,
       stream: useStream,
+      auto_route: autoRouteToggle.checked
     };
 
     setStreaming(true);
@@ -781,6 +865,9 @@
           return;
         }
         bubble.innerHTML = marked.parse(data.content);
+        if (data.model_used && data.original_model && data.model_used !== data.original_model) {
+          showRoutedModelTag(wrapper, data.model_used);
+        }
         scrollToBottom();
       } else {
         // Streaming: read SSE
@@ -819,6 +906,10 @@
               wrapper.remove();
               appendError(parsed.error);
               return;
+            }
+
+            if (parsed.routed_model) {
+              showRoutedModelTag(wrapper, parsed.routed_model);
             }
 
             if (parsed.token !== undefined) {

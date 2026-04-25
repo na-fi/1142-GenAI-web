@@ -1,0 +1,428 @@
+import json
+import uuid
+import os
+import subprocess
+from datetime import datetime
+from flask import Flask, Response, render_template, request, session, stream_with_context, send_file
+from flask_sqlalchemy import SQLAlchemy
+from openai import OpenAI
+from duckduckgo_search import DDGS
+
+app = Flask(__name__)
+app.secret_key = "groq-chat-secret-key-change-in-prod"
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat_history.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Database Models
+class ChatSession(db.Model):
+    id = db.Column(db.String(36), primary_key=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    messages = db.relationship('ChatMessage', backref='session', lazy=True, cascade="all, delete-orphan")
+
+class ChatMessage(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String(36), db.ForeignKey('chat_session.id'), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+with app.app_context():
+    db.create_all()
+
+MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "whisper-large-v3-turbo",
+]
+
+def model_supports_tools(model_name):
+    # Standard Groq models known to support tool use
+    tool_models = ["llama-3.3", "llama-3.1", "mixtral", "tool-use", "llama-4-scout"]
+    return any(tm in model_name.lower() for tm in tool_models)
+
+MAX_MESSAGES = 40  # 20 turns
+
+def get_session_id() -> str:
+    if "session_id" not in session:
+        session["session_id"] = str(uuid.uuid4())
+        new_session = ChatSession(id=session["session_id"])
+        db.session.add(new_session)
+        db.session.commit()
+    return session["session_id"]
+
+def get_history(session_id):
+    messages = ChatMessage.query.filter_by(session_id=session_id).order_by(ChatMessage.timestamp.asc()).all()
+    return [{"role": m.role, "content": m.content} for m in messages]
+
+def save_message(session_id, role, content):
+    new_msg = ChatMessage(session_id=session_id, role=role, content=content)
+    db.session.add(new_msg)
+    db.session.commit()
+    
+    # Truncate history if it exceeds MAX_MESSAGES
+    all_msgs = ChatMessage.query.filter_by(session_id=session_id).order_by(ChatMessage.timestamp.asc()).all()
+    if len(all_msgs) > MAX_MESSAGES:
+        to_delete = all_msgs[:-MAX_MESSAGES]
+        for m in to_delete:
+            db.session.delete(m)
+        db.session.commit()
+
+DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+
+# Tools implementation
+def search_web(query):
+    try:
+        with DDGS() as ddgs:
+            results = [r for r in ddgs.text(query, max_results=5)]
+            if not results:
+                return "No results found."
+            # Simplify results to avoid token overflow and formatting issues
+            simplified = [{"title": r.get("title", ""), "body": r.get("body", "")[:200]} for r in results]
+            return json.dumps(simplified)
+    except Exception as e:
+        return f"Search failed: {str(e)}"
+
+def execute_python(code):
+    try:
+        # Warning: Using subprocess for code execution is unsafe for production.
+        # This is for homework demonstration purposes.
+        result = subprocess.run(['python3', '-c', code], capture_output=True, text=True, timeout=10)
+        return json.dumps({"stdout": result.stdout, "stderr": result.stderr})
+    except Exception as e:
+        return f"Error executing code: {str(e)}"
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for current information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_python",
+            "description": "Run Python code for math or data tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "The Python code to execute."}
+                },
+                "required": ["code"]
+            }
+        }
+    }
+]
+
+def route_model(message, current_model, api_key):
+    if isinstance(message, list):
+         return current_model
+    
+    try:
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "You are a router. Based on the user message, decide which model to use. Respond ONLY with the model name from this list: llama-3.3-70b-versatile, llama-3.1-8b-instant. Use 70b for complex reasoning, math, or coding. Use 8b for simple chat, greetings, or short answers."},
+                {"role": "user", "content": message}
+            ],
+            max_tokens=20,
+            temperature=0
+        )
+        routed = response.choices[0].message.content.strip()
+        if routed in MODELS:
+            return routed
+    except Exception:
+        pass
+    return current_model
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/models")
+def models():
+    return {"models": MODELS}
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json()
+    message = data.get("message", "") # Could be string or list for multimodal
+    system_prompt = data.get("system_prompt", "").strip()
+    model = data.get("model", MODELS[0])
+    temperature = float(data.get("temperature", 0.7))
+    top_p = float(data.get("top_p", 0.9))
+    max_tokens = int(data.get("max_tokens", 1024))
+    api_key = data.get("api_key", "").strip()
+    use_stream = data.get("stream", True)
+    auto_route = data.get("auto_route", False)
+
+    if not message:
+        return {"error": "Message is required"}, 400
+    if not api_key:
+        return {"error": "API key is required"}, 400
+
+    session_id = get_session_id()
+    
+    # Ensure vision model is used if message is multimodal (list)
+    if isinstance(message, list):
+        # Only switch to a vision model if current model doesn't support it
+        # (Llama-4 Scout models are vision-capable)
+        is_vision_model = "vision" in model.lower() or "scout" in model.lower()
+        if not is_vision_model:
+            model = "meta-llama/llama-4-scout-17b-16e-instruct"
+    # Auto routing for text messages
+    elif auto_route:
+        model = route_model(message, model, api_key)
+
+    save_message(session_id, "user", json.dumps(message) if not isinstance(message, str) else message)
+    history = get_history(session_id)
+
+    # Process history for OpenAI API (parse JSON contents)
+    formatted_messages = []
+    active_prompt = system_prompt if system_prompt else DEFAULT_SYSTEM_PROMPT
+    formatted_messages.append({"role": "system", "content": active_prompt})
+    
+    for h in history:
+        content = h["content"]
+        # Only try to parse as JSON if it looks like a list or object
+        if content.startswith(("[", "{")):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list) and "vision" not in model:
+                    # Flatten to text if not using a vision model
+                    text_content = next((item["text"] for item in parsed if item.get("type") == "text"), "*(Image Attached)*")
+                    formatted_messages.append({"role": h["role"], "content": text_content})
+                else:
+                    formatted_messages.append({"role": h["role"], "content": parsed})
+                continue
+            except:
+                pass
+        formatted_messages.append({"role": h["role"], "content": content})
+
+    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+
+    if not use_stream:
+        try:
+            params = {
+                "model": model,
+                "messages": formatted_messages,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+            if model_supports_tools(model):
+                params["tools"] = TOOLS
+            
+            completion = client.chat.completions.create(**params)
+            
+            response_message = completion.choices[0].message
+            
+            # Handle tool calls
+            if hasattr(response_message, "tool_calls") and response_message.tool_calls:
+                formatted_messages.append(response_message)
+                tool_output_previews = []
+                for tool_call in response_message.tool_calls:
+                    function_name = tool_call.function.name
+                    function_args = json.loads(tool_call.function.arguments)
+                    
+                    if function_name == "search_web":
+                        query = function_args.get("query")
+                        tool_output_previews.append(f"🔍 **Tool: Searching for:** `{query}`...")
+                        result = search_web(query)
+                    elif function_name == "execute_python":
+                        code = function_args.get("code")
+                        tool_output_previews.append(f"💻 **Tool: Executing Python code:**\n```python\n{code}\n```")
+                        result = execute_python(code)
+                    else:
+                        result = "Tool not found"
+                        
+                    formatted_messages.append({
+                        "tool_call_id": tool_call.id,
+                        "role": "tool",
+                        "name": function_name,
+                        "content": result,
+                    })
+                
+                # Get final completion after tool results
+                second_completion = client.chat.completions.create(
+                    model=model,
+                    messages=formatted_messages,
+                )
+                assistant_text = second_completion.choices[0].message.content or ""
+                # Prepend tool usage visualization
+                if tool_output_previews:
+                    assistant_text = "\n\n".join(tool_output_previews) + "\n\n" + assistant_text
+            else:
+                assistant_text = response_message.content or ""
+
+            save_message(session_id, "assistant", assistant_text)
+            return {"content": assistant_text, "model_used": model}
+        except Exception as e:
+            return {"error": str(e)}, 500
+
+    def generate():
+        assistant_text = ""
+        try:
+            params = {
+                "model": model,
+                "messages": formatted_messages,
+                "temperature": temperature,
+                "top_p": top_p,
+                "max_tokens": max_tokens,
+                "stream": True,
+            }
+            if model_supports_tools(model):
+                params["tools"] = TOOLS
+
+            stream = client.chat.completions.create(**params)
+            
+            tool_calls = []
+            
+            for chunk in stream:
+                if not chunk.choices: continue
+                delta = chunk.choices[0].delta
+                
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        # Ensure the list is long enough for the current index
+                        while len(tool_calls) <= tc.index:
+                            tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                        
+                        if tc.id: tool_calls[tc.index]["id"] = tc.id
+                        if tc.function.name: tool_calls[tc.index]["function"]["name"] += tc.function.name
+                        if tc.function.arguments: tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+
+                if hasattr(delta, "content") and delta.content:
+                    assistant_text += delta.content
+                    payload = json.dumps({"token": delta.content, "model": model})
+                    yield f"data: {payload}\n\n"
+
+            # --- CRITICAL FIX: Move tool processing OUTSIDE the chunk loop ---
+            # Process tool calls AFTER the stream loop is complete
+            valid_tool_calls = []
+            for tc in tool_calls:
+                if tc.get("id") and tc["function"]["name"]:
+                    valid_tool_calls.append(tc)
+            
+            if valid_tool_calls:
+                # Construct assistant message correctly according to API specs
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": assistant_text if assistant_text else None,
+                    "tool_calls": valid_tool_calls
+                }
+                formatted_messages.append(assistant_msg)
+                
+                for tc in valid_tool_calls:
+                    function_name = tc["function"]["name"]
+                    try:
+                        function_args = json.loads(tc["function"]["arguments"])
+                    except:
+                        function_args = {}
+                    
+                    if function_name == "search_web":
+                        query = function_args.get("query", "")
+                        tool_msg = f"\n🔍 **Tool: Searching for:** `{query}`...\n"
+                        result = search_web(query)
+                    elif function_name == "execute_python":
+                        code = function_args.get("code", "")
+                        tool_msg = f"\n💻 **Tool: Executing Python code:**\n```python\n{code}\n```\n"
+                        result = execute_python(code)
+                    else:
+                        tool_msg = f"\n*Tool not found: {function_name}*\n"
+                        result = "Tool not found"
+                    
+                    yield f"data: {json.dumps({'token': tool_msg})}\n\n"
+                        
+                    formatted_messages.append({
+                        "tool_call_id": tc["id"],
+                        "role": "tool",
+                        "name": function_name,
+                        "content": result,
+                    })
+
+                # Stream the final response after tool execution
+                # Re-pass the temperature and other params
+                final_stream = client.chat.completions.create(
+                    model=model,
+                    messages=formatted_messages,
+                    stream=True,
+                    temperature=temperature,
+                )
+                for chunk in final_stream:
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        assistant_text += delta.content
+                        payload = json.dumps({"token": delta.content})
+                        yield f"data: {payload}\n\n"
+
+            save_message(session_id, "assistant", assistant_text)
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    response = Response(stream_with_context(generate()), mimetype="text/event-stream")
+    response.headers["X-Accel-Buffering"] = "no"
+    return response
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+    api_key = request.form.get("api_key")
+    if "file" not in request.files or not api_key:
+        return {"error": "File and API key required"}, 400
+    
+    audio_file = request.files["file"]
+    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    
+    try:
+        # Save temp file for OpenAI SDK
+        temp_path = f"temp_{uuid.uuid4()}.wav"
+        audio_file.save(temp_path)
+        
+        with open(temp_path, "rb") as f:
+            transcript = client.audio.transcriptions.create(
+                file=f,
+                model="whisper-large-v3",
+                response_format="text"
+            )
+        os.remove(temp_path)
+        return {"text": transcript}
+    except Exception as e:
+        if os.path.exists(temp_path): os.remove(temp_path)
+        return {"error": str(e)}, 500
+
+@app.route("/export")
+def export_chat():
+    session_id = get_session_id()
+    history = get_history(session_id)
+    content = f"# Chat History - {session_id}\n\n"
+    for msg in history:
+        content += f"### {msg['role'].capitalize()}\n{msg['content']}\n\n---\n\n"
+    
+    temp_file = f"chat_export_{session_id}.md"
+    with open(temp_file, "w") as f:
+        f.write(content)
+    
+    return send_file(temp_file, as_attachment=True, download_name="chat_history.md")
+
+@app.route("/clear", methods=["POST"])
+def clear():
+    session_id = get_session_id()
+    ChatMessage.query.filter_by(session_id=session_id).delete()
+    db.session.commit()
+    return {"status": "cleared"}
+
+if __name__ == "__main__":
+    app.run(debug=True)
