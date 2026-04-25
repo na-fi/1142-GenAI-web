@@ -133,11 +133,11 @@ async def _run_github_mcp(action, tool_name=None, tool_args=None):
         env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": GITHUB_TOKEN},
     )
     async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
+        async with ClientSession(read, write) as mcp_session:
+            await mcp_session.initialize()
             if action == "list":
-                return (await session.list_tools()).tools
-            result = await session.call_tool(tool_name, tool_args or {})
+                return (await mcp_session.list_tools()).tools
+            result = await mcp_session.call_tool(tool_name, tool_args or {})
             return result.content[0].text if result.content else ""
 
 def _load_github_tools():
