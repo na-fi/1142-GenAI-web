@@ -267,6 +267,8 @@ def dispatch_tool(name, args):
     if name == "execute_python":
         c = args.get("code", "")
         return f"💻 **Tool: Executing Python code:**\n```python\n{c}\n```", execute_python(c)
+    if name in GITHUB_TOOL_NAMES:
+        return f"🐙 **GitHub:** `{name}`...", call_github_tool(name, args)
     return f"*Tool not found: {name}*", "Tool not found"
 
 def route_model(message, current_model, api_key):
@@ -367,7 +369,7 @@ def chat():
                 "stream": False,
             }
             if model_supports_tools(model):
-                params["tools"] = TOOLS
+                params["tools"] = TOOLS + GITHUB_TOOLS
                 params["tool_choice"] = "auto"
 
             try:
@@ -441,7 +443,7 @@ def chat():
                 "stream": True,
             }
             if model_supports_tools(model):
-                params["tools"] = TOOLS
+                params["tools"] = TOOLS + GITHUB_TOOLS
                 params["tool_choice"] = "auto"
 
             tool_calls = []
