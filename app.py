@@ -88,7 +88,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "2. execute_python: Call this for math, calculations, or running code.\n"
     "3. search_web: You are FORBIDDEN from calling search_web unless the user's message literally contains one of these trigger words: 'search', 'google', 'look up', 'lookup'. "
     "If the user asks about news, current events, recent information, or anything you may not know, and their message does NOT contain a trigger word, you MUST answer from your own knowledge (or say you are not sure) and suggest they ask you to 'search' for the latest info. "
-    "Do NOT call search_web on your own initiative under any circumstances."
+    "Do NOT call search_web on your own initiative under any circumstances.\n"
+    "4. GitHub tools (search_repositories, get_file_contents, list_issues, search_code, list_commits, and others): "
+    "ALWAYS use these when the user asks about GitHub repositories, files, issues, commits, or code. "
+    "Never say you cannot access GitHub — you have tools for it. "
+    "If the user refers to 'my GitHub' but does not provide a username, ask for their GitHub username before calling a tool."
 )
 
 # Tools implementation
